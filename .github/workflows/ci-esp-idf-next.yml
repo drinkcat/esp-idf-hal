@@ -2,8 +2,6 @@ name: CIEspIdfNext
 
 on:
   push:
-    branches:
-      - master
   workflow_dispatch:
   schedule:
     - cron: '50 5 * * *'
