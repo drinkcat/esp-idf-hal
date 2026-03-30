@@ -6,12 +6,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use esp_idf_sys::*;
 
 use crate::gpio::OutputPin;
 use crate::interrupt::asynch::HalIsrNotification;
 use crate::rmt::config::{Loop, TransmitConfig, TxChannelConfig};
-use crate::rmt::encoder::{into_raw, Encoder, RawEncoder};
+use crate::rmt::encoder::{into_raw, Encoder, EncoderWrapper, RawEncoder};
 use crate::rmt::tx_queue::TxQueue;
 use crate::rmt::TxDoneEventData;
 use crate::rmt::{assert_not_in_isr, EncoderBuffer, RmtChannel};
@@ -29,6 +30,15 @@ pub struct TxChannelDriver<'d> {
     handle: rmt_channel_handle_t,
     on_transmit_data: Box<UserData<'d>>,
     _p: PhantomData<&'d mut ()>,
+}
+
+fn make_encoder_buffers<E: Encoder>(
+    encoders: impl IntoIterator<Item = E>,
+) -> VecDeque<EncoderBuffer<EncoderWrapper<E>>> {
+    encoders
+        .into_iter()
+        .map(|encoder| EncoderBuffer::new(into_raw(encoder)))
+        .collect()
 }
 
 impl<'d> TxChannelDriver<'d> {
@@ -305,13 +315,7 @@ impl<'d> TxChannelDriver<'d> {
     where
         E::Item: Clone,
     {
-        let mut pending = TxQueue::new(
-            encoders
-                .into_iter()
-                .map(|encoder| EncoderBuffer::new(into_raw(encoder)))
-                .collect(),
-            self,
-        );
+        let mut pending = TxQueue::new(make_encoder_buffers(encoders), self);
 
         for signal in iter {
             pending.push(signal.as_ref(), config)?;
@@ -333,14 +337,24 @@ impl<'d> TxChannelDriver<'d> {
     pub fn queue<E: Encoder>(
         &mut self,
         encoders: impl IntoIterator<Item = E>,
-    ) -> TxQueue<'_, 'd, E> {
-        TxQueue::new(
-            encoders
-                .into_iter()
-                .map(|encoder| EncoderBuffer::new(into_raw(encoder)))
-                .collect(),
-            self,
-        )
+    ) -> TxQueue<'d, &mut TxChannelDriver<'d>, E> {
+        TxQueue::new(make_encoder_buffers(encoders), self)
+    }
+
+    /// Creates a new queue for transmitting multiple signals with the given encoders, taking ownership of the channel.
+    /// This can be used when only a single queue is ever needed.
+    ///
+    /// For more information, see [`TxQueue`].
+    ///
+    /// # Panics
+    ///
+    /// If no encoders are provided.
+    #[must_use]
+    pub fn into_queue<E: Encoder>(
+        self,
+        encoders: impl IntoIterator<Item = E>,
+    ) -> TxQueue<'d, TxChannelDriver<'d>, E> {
+        TxQueue::new(make_encoder_buffers(encoders), self)
     }
 
     /// Asynchronously waits until the next pending transmission has finished.
@@ -435,6 +449,12 @@ impl<'d> Drop for TxChannelDriver<'d> {
         };
 
         unsafe { rmt_del_channel(self.handle) };
+    }
+}
+
+impl<'d> AsMut<TxChannelDriver<'d>> for TxChannelDriver<'d> {
+    fn as_mut(&mut self) -> &mut TxChannelDriver<'d> {
+        self
     }
 }
 

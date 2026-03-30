@@ -1,4 +1,5 @@
 use core::fmt;
+use core::marker::PhantomData;
 
 use alloc::vec::Vec;
 
@@ -85,32 +86,42 @@ impl<E: RawEncoder> EncoderBuffer<E> {
 /// When the `TxQueue` is dropped, it will wait for all transmissions to finish.
 /// This ensures that the internal buffers are not dropped while they are still in use
 /// by the peripheral.
-pub struct TxQueue<'c, 'd, E: Encoder> {
+pub struct TxQueue<'d, C, E: Encoder>
+where
+    C: AsMut<TxChannelDriver<'d>>,
+{
     queue: VecDeque<EncoderBuffer<EncoderWrapper<E>>>,
-    channel: &'c mut TxChannelDriver<'d>,
+    channel: C,
+    _phantom: PhantomData<&'d ()>,
 }
 
-impl<'c, 'd, E: Encoder> TxQueue<'c, 'd, E> {
+impl<'d, C, E: Encoder> TxQueue<'d, C, E>
+where
+    C: AsMut<TxChannelDriver<'d>>,
+{
     pub(crate) fn new(
         queue: VecDeque<EncoderBuffer<EncoderWrapper<E>>>,
-        channel: &'c mut TxChannelDriver<'d>,
+        channel: C,
     ) -> Self {
         assert!(
             !queue.is_empty(),
             "At least one encoder is required to encode a TxQueue"
         );
 
-        Self { queue, channel }
+        Self { queue, channel, _phantom: PhantomData }
     }
 
     /// Returns a mutable reference to the channel this queue is using.
     #[must_use]
     pub fn channel(&mut self) -> &mut TxChannelDriver<'d> {
-        self.channel
+        self.channel.as_mut()
     }
 }
 
-impl<'c, 'd, E: Encoder> TxQueue<'c, 'd, E> {
+impl<'d, C, E: Encoder> TxQueue<'d, C, E>
+where
+    C: AsMut<TxChannelDriver<'d>>,
+{
     /// Pushes a signal onto the transmission queue.
     ///
     /// The signal will be cloned into an internal buffer to ensure that it is valid for the entire
@@ -145,14 +156,14 @@ impl<'c, 'd, E: Encoder> TxQueue<'c, 'd, E> {
         //
         // If there are N transmissions or more in progress, it would have to wait until there are less than
         // N transmissions in progress to guarantee that one encoder is available.
-        while self.channel.queue_size() >= self.queue.len() {
+        while self.channel.as_mut().queue_size() >= self.queue.len() {
             // If we should not block, replicate the error from esp-idf's send function
             if config.queue_non_blocking {
                 return Err(EspError::from_infallible::<ESP_ERR_TIMEOUT>());
             }
 
             // This waits for a transmission to finish
-            crate::task::block_on(self.channel.wait_for_progress());
+            crate::task::block_on(self.channel.as_mut().wait_for_progress());
         }
 
         // This returns the next encoder and the buffer of the encoder.
@@ -165,7 +176,7 @@ impl<'c, 'd, E: Encoder> TxQueue<'c, 'd, E> {
             .expect("queue should never be empty")
             .update_from_slice(signal);
 
-        unsafe { self.channel.start_send(next_encoder, buffer, config) }?;
+        unsafe { self.channel.as_mut().start_send(next_encoder, buffer, config) }?;
 
         // If the channel queue is shorter than the number of encoders in this TxQueue,
         // and the non-blocking flag is set, it could happen that the start_send errors.
@@ -179,15 +190,19 @@ impl<'c, 'd, E: Encoder> TxQueue<'c, 'd, E> {
     }
 }
 
-impl<'c, 'd, E: Encoder> Drop for TxQueue<'c, 'd, E> {
+impl<'d, C, E: Encoder> Drop for TxQueue<'d, C, E>
+where
+    C: AsMut<TxChannelDriver<'d>>,
+{
     fn drop(&mut self) {
         // This ensures that all transmissions are done before the internal buffers are dropped.
-        let _ = self.channel.wait_all_done(None);
+        let _ = self.channel.as_mut().wait_all_done(None);
     }
 }
 
-impl<'c, 'd, E: Encoder> fmt::Debug for TxQueue<'c, 'd, E>
+impl<'d, C, E: Encoder> fmt::Debug for TxQueue<'d, C, E>
 where
+    C: AsMut<TxChannelDriver<'d>> + fmt::Debug,
     E: fmt::Debug,
     E::Item: fmt::Debug,
 {
